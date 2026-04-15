@@ -116,12 +116,14 @@ const TIMEZONE_ABBREVIATIONS: Readonly<Record<string, number>> = {
  * Regex patterns for timestamp extraction, ordered by specificity.
  */
 const PATTERNS: readonly {
+  readonly name: string;
   readonly regex: RegExp;
   readonly parse: (match: string) => PatternMatch | null;
 }[] = [
   // ISO8601 / RFC3339 — explicit timezone, never ambiguous.
   // Also covers RFC5424 syslog, which is just ISO with fractional seconds.
   {
+    name: "ISO8601",
     regex: /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})/g,
     parse: (match) => {
       const dt = DateTime.fromISO(match, { zone: "utc" });
@@ -136,6 +138,7 @@ const PATTERNS: readonly {
   // `+HHMM` without. We parse the wall clock with `UTC+0` and add the
   // offset manually rather than relying on undocumented token behavior.
   {
+    name: "Nginx/Apache CLF",
     regex: /(\d{2}\/[A-Z][a-z]{2}\/\d{4}:\d{2}:\d{2}:\d{2})\s([+-])(\d{2})(\d{2})/g,
     parse: (match) => {
       const m = /^(\d{2}\/[A-Z][a-z]{2}\/\d{4}:\d{2}:\d{2}:\d{2})\s([+-])(\d{2})(\d{2})$/.exec(match);
@@ -158,6 +161,7 @@ const PATTERNS: readonly {
   // RFC2822: `Wed, 03 Apr 2026 15:20:50 GMT` or `... +0000`.
   // Always carries a zone (named or numeric) — never ambiguous.
   {
+    name: "RFC2822",
     regex:
       /(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+(?:GMT|UTC|UT|[A-Z]{1,5}|[+-]\d{4})/g,
     parse: (match) => {
@@ -170,6 +174,7 @@ const PATTERNS: readonly {
   // token. The `[ T]` separator also catches bare ISO without an explicit
   // zone (e.g. "2026-04-04T18:02:31"), which is treated as ambiguous.
   {
+    name: "Log datetime",
     regex: /\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:\s[A-Z]{2,5})?/g,
     parse: (match) => {
       // Normalize the date/time separator so a single Luxon format covers
@@ -211,6 +216,7 @@ const PATTERNS: readonly {
 
   // Slash-separated date: YYYY/MM/DD[ T]HH:mm:ss[.fff] — always ambiguous.
   {
+    name: "Slash datetime",
     regex: /\d{4}\/\d{2}\/\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?/g,
     parse: (match) => {
       const trimmed = match.replace("T", " ");
@@ -233,6 +239,7 @@ const PATTERNS: readonly {
   // 16- and 19-digit values exceed Number.MAX_SAFE_INTEGER near present-day
   // timestamps, so we parse via BigInt and divide down to milliseconds.
   {
+    name: "Unix epoch",
     regex: /(?<!\d)\d{19}(?!\d)|(?<!\d)\d{16}(?!\d)|(?<!\d)\d{13}(?!\d)|(?<!\d)\d{10}(?:\.\d{1,3})?(?!\d)/g,
     parse: (match) => {
       if (match.length === 19) {
@@ -257,6 +264,51 @@ const PATTERNS: readonly {
     },
   },
 
+  // MongoDB ObjectID: 24-character hex string where the first 4 bytes (8 hex
+  // chars) encode a Unix timestamp in seconds. Always UTC, never ambiguous.
+  //
+  // Placed after the epoch pattern so pure-digit strings are handled there,
+  // and before syslog/month-name patterns which can't produce hex. A range
+  // check (year 2000–2100) reduces false positives from arbitrary 24-char
+  // hex strings (e.g. truncated SHA hashes).
+  {
+    name: "MongoDB ObjectID",
+    regex: /\b[0-9a-fA-F]{24}\b/g,
+    parse: (match) => {
+      const timestampHex = match.slice(0, 8);
+      const epochSeconds = parseInt(timestampHex, 16);
+
+      // Sanity: reject if outside 2000-01-01 .. 2100-01-01
+      if (epochSeconds < 946684800 || epochSeconds > 4102444800) return null;
+
+      return { epochMs: epochSeconds * 1000, ambiguous: false };
+    },
+  },
+
+  // UUID v7 (RFC 9562): the first 48 bits encode a Unix timestamp in
+  // milliseconds. In the canonical string form `xxxxxxxx-xxxx-7xxx-yxxx-…`
+  // that's the 12 hex digits before the version nibble. The version field
+  // (`7`) and variant bits (`8`/`9`/`a`/`b`) are validated structurally.
+  // Always UTC, never ambiguous.
+  //
+  // Placed after MongoDB ObjectID so 24-char hex strings are tried first
+  // (a UUID is 36 chars with dashes — no collision risk) and before
+  // syslog/month-name patterns which can't produce hex.
+  {
+    name: "UUID v7",
+    regex: /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b/g,
+    parse: (match) => {
+      // First 48 bits = first 8 hex chars + next 4 hex chars (positions 9-12).
+      const msHex = match.slice(0, 8) + match.slice(9, 13);
+      const epochMs = parseInt(msHex, 16);
+
+      // Sanity: reject if outside 2000-01-01 .. 2100-01-01
+      if (epochMs < 946684800000 || epochMs > 4102444800000) return null;
+
+      return { epochMs, ambiguous: false };
+    },
+  },
+
   // Syslog RFC3164: `Apr  3 15:20:50` (no year, no timezone). Single-digit
   // days are space-padded per spec ("Apr  3" with two spaces), but we accept
   // one-or-more whitespace to be lenient. Doubly ambiguous: missing year is
@@ -266,6 +318,7 @@ const PATTERNS: readonly {
   // Does not collide with the month-name pattern: month-name requires a 4-digit
   // year, which can't appear in the `HH:mm:ss` position syslog expects here.
   {
+    name: "Syslog RFC3164",
     regex: /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\b/g,
     parse: (match) => {
       const normalized = match.replace(/\s+/g, " ");
@@ -279,6 +332,7 @@ const PATTERNS: readonly {
   // "April 3, 2026 15:20", "Apr 3, 2026" (date-only), etc.
   // Always ambiguous — no timezone component.
   {
+    name: "Localized English",
     regex:
       /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:[a-z]+)?\b\s+\d{1,2},?\s+\d{4}(?:(?:,\s+|\s+)\d{1,2}:\d{2}(?::\d{2})?(?:\s*(?:AM|PM))?)?/gi,
     parse: (match) => {
@@ -309,6 +363,7 @@ const PATTERNS: readonly {
   // first — a full "2026-04-04 15:20:00 PST" is picked up by the log
   // pattern and this one never fires on it.
   {
+    name: "Bare time",
     regex: /^[ \t]*\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,6})?(?:[ \t]+[A-Z]{2,5})?[ \t]*$/gm,
     parse: (match) => {
       const parts = /^[ \t]*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,6})?)(?:[ \t]+([A-Z]{2,5}))?[ \t]*$/.exec(match);
@@ -386,7 +441,7 @@ export function extractTimestamps(input: string): ExtractResult {
     return claimedRanges.some((r) => start < r.end && end > r.start);
   }
 
-  outer: for (const { regex, parse } of PATTERNS) {
+  outer: for (const { name, regex, parse } of PATTERNS) {
     regex.lastIndex = 0;
 
     let match: RegExpExecArray | null;
@@ -408,6 +463,8 @@ export function extractTimestamps(input: string): ExtractResult {
         ambiguous: result.ambiguous,
         label: null,
         url: null,
+        source: match[0],
+        format: name,
       });
 
       if (results.length >= MAX_EXTRACT) {
