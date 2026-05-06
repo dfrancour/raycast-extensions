@@ -57,7 +57,7 @@ export function ParsedRow({
               <Action
                 title="Interpret as Local"
                 icon={Icon.Clock}
-                shortcut={{ modifiers: ["cmd"], key: "l" }}
+                shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
                 onAction={() => {
                   onResolveTimezone(i, DateTime.local().zoneName);
                 }}
